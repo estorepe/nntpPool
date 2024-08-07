@@ -1,4 +1,4 @@
-module github.com/Tensai75/nntpPool
+module github.com/estorepe/nntpPool
 
 go 1.16
 
