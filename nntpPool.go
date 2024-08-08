@@ -13,16 +13,21 @@ import (
 
 var (
 	// message channels
-	WarnChan  = make(chan error, 10)  // warning messages (errors which did not cause the pool to fail)
+	WarnChan = make(
+		chan error,
+		10,
+	) // warning messages (errors which did not cause the pool to fail)
 	LogChan   = make(chan string, 10) // informative messages
 	DebugChan = make(chan string, 10) // additional debug messages
 )
 
 var (
 	errMaxConnsShouldBePositive = errors.New("max conns should be greater than 0")
-	errConsIsGreaterThanMax     = errors.New("initial amount of connections should be lower than or equal to max conns")
-	errPoolWasClosed            = errors.New("connection pool was closed")
-	errConnIsNil                = errors.New("connection is nil")
+	errConsIsGreaterThanMax     = errors.New(
+		"initial amount of connections should be lower than or equal to max conns",
+	)
+	errPoolWasClosed = errors.New("connection pool was closed")
+	errConnIsNil     = errors.New("connection is nil")
 )
 
 type ConnectionPool interface {
@@ -91,6 +96,8 @@ type connectionPool struct {
 	maxTooManyConnsErrors uint32
 	maxConnErrors         uint32
 
+	bufferPool *BufferPool
+
 	conns              uint32
 	connAttempts       uint32
 	closed             bool
@@ -101,6 +108,56 @@ type connectionPool struct {
 	startupWG          sync.WaitGroup
 	created            bool
 	maxConnsUsed       uint32
+}
+
+// BufferPool implementation
+type BufferPool struct {
+	size      int
+	pool      [][]byte
+	maxLength int
+	mutex     sync.Mutex
+	useShared bool
+}
+
+func NewBufferPool(size, maxLength int, useShared bool) *BufferPool {
+	return &BufferPool{
+		size:      size,
+		maxLength: maxLength,
+		useShared: useShared,
+	}
+}
+
+func (p *BufferPool) Get() []byte {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if len(p.pool) > 0 {
+		buf := p.pool[len(p.pool)-1]
+		p.pool = p.pool[:len(p.pool)-1]
+		return buf
+	}
+
+	if p.useShared {
+		return make([]byte, p.size, p.size)
+	} else {
+		return make([]byte, p.size)
+	}
+}
+
+func (p *BufferPool) Put(buffer []byte) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.maxLength == 0 || len(p.pool) < p.maxLength {
+		p.pool = append(p.pool, buffer)
+	}
+}
+
+func (p *BufferPool) Drain() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	p.pool = nil
 }
 
 // Opens new connection pool.
@@ -130,6 +187,12 @@ func New(cfg *Config, initialConns uint32) (ConnectionPool, error) {
 		maxTooManyConnsErrors: cfg.MaxTooManyConnsErrors,
 		maxConnErrors:         cfg.MaxConnErrors,
 
+		bufferPool: NewBufferPool(
+			4096,
+			1024,
+			true,
+		), // size 4096, max length 1024, use shared memory
+
 		closed:      false,
 		fatalError:  nil,
 		serverLimit: cfg.MaxConns,
@@ -146,7 +209,13 @@ func New(cfg *Config, initialConns uint32) (ConnectionPool, error) {
 	}
 	pool.created = true
 	if initialConns > 0 && pool.conns < initialConns {
-		pool.log(fmt.Sprintf("pool created with errors (%v of %v requested connections available)", pool.conns, initialConns))
+		pool.log(
+			fmt.Sprintf(
+				"pool created with errors (%v of %v requested connections available)",
+				pool.conns,
+				initialConns,
+			),
+		)
 	} else {
 		pool.log("pool created successfully")
 	}
@@ -237,6 +306,7 @@ func (cp *connectionPool) Close() {
 			conn.close()
 		}
 	}
+	cp.bufferPool.Drain()
 	cp.closed = true
 	cp.conns = 0
 	cp.connAttempts = 0
@@ -264,6 +334,9 @@ func (cp *connectionPool) MaxConns() uint32 {
 func (cp *connectionPool) factory() (*nntp.Conn, error) {
 	var conn *nntp.Conn
 	var err error
+	buf := cp.bufferPool.Get()
+	defer cp.bufferPool.Put(buf)
+
 	if cp.ssl {
 		sslConfig := tls.Config{
 			InsecureSkipVerify: cp.skipSslCheck,
@@ -303,7 +376,13 @@ func (cp *connectionPool) addConn() {
 		}
 		if cp.connAttempts >= cp.serverLimit {
 			// ignoring the connection attempt if there are already too many attempts
-			cp.debug(fmt.Sprintf("ignoring new connection attempt (current connection attempts: %v | current server limit: %v connections)", cp.connAttempts, cp.serverLimit))
+			cp.debug(
+				fmt.Sprintf(
+					"ignoring new connection attempt (current connection attempts: %v | current server limit: %v connections)",
+					cp.connAttempts,
+					cp.serverLimit,
+				),
+			)
 			cp.connsMutex.Unlock()
 			return
 		}
@@ -334,12 +413,19 @@ func (cp *connectionPool) addConn() {
 			cp.error(err)
 			// abort and handle error
 			abort()
-			if cp.maxTooManyConnsErrors > 0 && (err.Error()[0:3] == "482" || err.Error()[0:3] == "502") && cp.conns > 0 {
+			if cp.maxTooManyConnsErrors > 0 &&
+				(err.Error()[0:3] == "482" || err.Error()[0:3] == "502") &&
+				cp.conns > 0 {
 				// handle too many connections error
 				cp.tooManyConnsErrors++
 				if cp.tooManyConnsErrors >= cp.maxTooManyConnsErrors && cp.serverLimit > cp.conns {
 					cp.serverLimit = cp.conns
-					cp.error(fmt.Errorf("reducing max connections to %v due to repeated 'too many connections' error", cp.serverLimit))
+					cp.error(
+						fmt.Errorf(
+							"reducing max connections to %v due to repeated 'too many connections' error",
+							cp.serverLimit,
+						),
+					)
 				}
 			} else {
 				// handle any other error
@@ -357,7 +443,9 @@ func (cp *connectionPool) addConn() {
 			cp.connsMutex.Unlock()
 			// retry to connect
 			go func() {
-				cp.debug(fmt.Sprintf("waiting %v seconds for next connection retry", cp.connWaitTime))
+				cp.debug(
+					fmt.Sprintf("waiting %v seconds for next connection retry", cp.connWaitTime),
+				)
 				time.Sleep(cp.connWaitTime)
 				cp.addConn()
 			}()
@@ -375,7 +463,13 @@ func (cp *connectionPool) addConn() {
 			timestamp: time.Now(),
 		}:
 			cp.conns++
-			cp.debug(fmt.Sprintf("new connection opened (%v of %v connections available)", cp.conns, cp.serverLimit))
+			cp.debug(
+				fmt.Sprintf(
+					"new connection opened (%v of %v connections available)",
+					cp.conns,
+					cp.serverLimit,
+				),
+			)
 
 		// if the connection channel is full, abort
 		default:
@@ -391,7 +485,9 @@ func (cp *connectionPool) closeConn(conn *NNTPConn) {
 	cp.conns--
 	cp.connAttempts--
 	conn.close()
-	cp.debug(fmt.Sprintf("connection closed (%v of %v connections available)", cp.conns, cp.serverLimit))
+	cp.debug(
+		fmt.Sprintf("connection closed (%v of %v connections available)", cp.conns, cp.serverLimit),
+	)
 }
 
 func (cp *connectionPool) checkConnIsHealthy(conn NNTPConn) bool {
@@ -402,6 +498,7 @@ func (cp *connectionPool) checkConnIsHealthy(conn NNTPConn) bool {
 		cp.closeConn(&conn)
 		return false
 	}
+	// closing unhealthy connection
 	// closing unhealthy connection
 	if cp.healthCheck {
 		if err := conn.ping(); err != nil {
