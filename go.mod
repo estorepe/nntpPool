@@ -1,5 +1,5 @@
 module github.com/estorepe/nntpPool
 
-go 1.16
+go 1.22.2
 
-require github.com/Tensai75/nntp v0.1.1
+require github.com/estorepe/nntp v0.0.0-20240808065239-266e66221abf
